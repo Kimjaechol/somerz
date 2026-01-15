@@ -1,26 +1,24 @@
 package com.somerz.translator.viewmodel
 
-import android.util.Base64
-import androidx.annotation.OptIn
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.google.firebase.Firebase
+import com.google.firebase.ai.GenerativeBackend
 import com.google.firebase.ai.ai
-import com.google.firebase.ai.type.LiveContentResponse
-import com.google.firebase.ai.type.LiveGenerationConfig
-import com.google.firebase.ai.type.MediaData
+import com.google.firebase.ai.type.InlineDataPart
+import com.google.firebase.ai.type.LiveSession
 import com.google.firebase.ai.type.PublicPreviewAPI
 import com.google.firebase.ai.type.ResponseModality
-import com.google.firebase.ai.type.SpeechConfig
+import com.google.firebase.ai.type.Voices
 import com.google.firebase.ai.type.content
+import com.google.firebase.ai.type.liveGenerationConfig
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.runBlocking
 
 /**
  * Language pair for translation
@@ -60,15 +58,20 @@ sealed class TranslationState {
 @OptIn(PublicPreviewAPI::class)
 class TranslatorViewModel : ViewModel() {
 
-    private val generativeModel = Firebase.ai.liveModel(
-        modelName = "gemini-2.0-flash-live-preview-04-09",
-        generationConfig = LiveGenerationConfig(
-            responseModality = ResponseModality.AUDIO,
-            speechConfig = SpeechConfig(voiceName = "Kore") // Natural voice
+    // Live model with audio response configuration using DSL builder
+    private val liveModel by lazy {
+        Firebase.ai(backend = GenerativeBackend.googleAI()).liveModel(
+            modelName = "gemini-2.0-flash-live-preview-04-09",
+            generationConfig = liveGenerationConfig {
+                responseModality = ResponseModality.AUDIO
+                speechConfig {
+                    voice = Voices.KORE
+                }
+            }
         )
-    )
+    }
 
-    private var session: com.google.firebase.ai.type.LiveSession? = null
+    private var session: LiveSession? = null
 
     // UI State
     var translationState by mutableStateOf<TranslationState>(TranslationState.Idle)
@@ -134,7 +137,8 @@ class TranslatorViewModel : ViewModel() {
                 _transcription.value = ""
                 _audioOutput.value = null
 
-                session = generativeModel.connect()
+                // Connect to Live API
+                session = liveModel.connect()
 
                 // Send system prompt
                 session?.send(buildSystemPrompt())
@@ -143,7 +147,17 @@ class TranslatorViewModel : ViewModel() {
 
                 // Listen for responses
                 session?.receive()?.collect { response ->
-                    handleResponse(response)
+                    // Handle text response
+                    response.text?.let { text ->
+                        _transcription.value = _transcription.value + text
+                    }
+
+                    // Handle audio response (inline data)
+                    response.data?.filterIsInstance<InlineDataPart>()?.forEach { inlineData ->
+                        if (inlineData.mimeType.startsWith("audio/")) {
+                            _audioOutput.value = inlineData.inlineData
+                        }
+                    }
                 }
 
             } catch (e: Exception) {
@@ -153,35 +167,20 @@ class TranslatorViewModel : ViewModel() {
     }
 
     /**
-     * Handle response from Gemini Live API
-     */
-    private fun handleResponse(response: LiveContentResponse) {
-        response.data?.forEach { part ->
-            // Handle audio response
-            if (part is MediaData) {
-                val audioBytes = Base64.decode(part.data, Base64.DEFAULT)
-                _audioOutput.value = audioBytes
-            }
-        }
-
-        // Handle text transcription if available
-        response.text?.let { text ->
-            _transcription.value = _transcription.value + text
-        }
-    }
-
-    /**
      * Send audio data for translation
      */
     fun sendAudioData(audioData: ByteArray) {
         if (translationState != TranslationState.Active || session == null) return
 
-        runBlocking {
+        viewModelScope.launch {
             try {
-                val base64Audio = Base64.encodeToString(audioData, Base64.NO_WRAP)
+                // Send audio as inline data
                 session?.send(
                     content {
-                        blob("audio/pcm;rate=16000", base64Audio.toByteArray())
+                        inlineData(
+                            mimeType = "audio/pcm;rate=16000",
+                            data = audioData
+                        )
                     }
                 )
             } catch (e: Exception) {
@@ -221,7 +220,7 @@ class TranslatorViewModel : ViewModel() {
 
     override fun onCleared() {
         super.onCleared()
-        runBlocking {
+        viewModelScope.launch {
             session?.close()
         }
     }
